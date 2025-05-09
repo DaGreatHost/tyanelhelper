@@ -8,6 +8,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     ContextTypes,
     filters,
+    ChatJoinRequestHandler,  # Added this import
 )
 from utils.database import Database
 from utils.messages import Messages
@@ -267,8 +268,8 @@ def main() -> None:
     application.add_handler(CommandHandler("set_approval", set_approval))
     application.add_handler(CommandHandler("stats", stats))
     
-    # Chat join request handler
-    application.add_handler(MessageHandler(filters.StatusUpdate.CHAT_JOIN_REQUEST, handle_chat_join_request))
+    # Chat join request handler - using ChatJoinRequestHandler instead of MessageHandler with filters
+    application.add_handler(ChatJoinRequestHandler(handle_chat_join_request))
     
     # Callback query handler
     application.add_handler(CallbackQueryHandler(handle_callback))
