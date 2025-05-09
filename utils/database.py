@@ -1,7 +1,7 @@
 import sqlite3
 import os
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 class Database:
     def __init__(self, db_path="telegram_bot.db"):
@@ -14,16 +14,23 @@ class Database:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
-        # Channels table
+        # Channels table - added approval_timeout field
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS channels (
             channel_id INTEGER PRIMARY KEY,
             title TEXT NOT NULL,
             welcome_message TEXT,
             approval_message TEXT,
+            approval_timeout INTEGER DEFAULT 24,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP
         )
         ''')
+        
+        # Add approval_timeout column if it doesn't exist
+        try:
+            cursor.execute("SELECT approval_timeout FROM channels LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE channels ADD COLUMN approval_timeout INTEGER DEFAULT 24")
         
         # Admins table
         cursor.execute('''
@@ -44,18 +51,32 @@ class Database:
         )
         ''')
         
-        # Join requests tracking
+        # Join requests tracking - added expires_at field
         cursor.execute('''
         CREATE TABLE IF NOT EXISTS join_requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             channel_id INTEGER,
             user_id INTEGER,
             requested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            expires_at DATETIME,
             approved_at DATETIME,
+            rejected_at DATETIME,
             FOREIGN KEY (channel_id) REFERENCES channels(channel_id)
         )
         ''')
         
+        # Add expires_at column if it doesn't exist
+        try:
+            cursor.execute("SELECT expires_at FROM join_requests LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE join_requests ADD COLUMN expires_at DATETIME")
+        
+        # Add rejected_at column if it doesn't exist
+        try:
+            cursor.execute("SELECT rejected_at FROM join_requests LIMIT 1")
+        except sqlite3.OperationalError:
+            cursor.execute("ALTER TABLE join_requests ADD COLUMN rejected_at DATETIME")
+            
         conn.commit()
         conn.close()
 
@@ -173,6 +194,25 @@ class Database:
             return False
         finally:
             conn.close()
+            
+    def set_approval_timeout(self, channel_id, hours):
+        """Set approval timeout in hours for a channel."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            cursor.execute(
+                "UPDATE channels SET approval_timeout = ? WHERE channel_id = ?",
+                (hours, channel_id)
+            )
+            conn.commit()
+            return True
+        except Exception as e:
+            logging.error(f"Database error: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
 
     def get_channel(self, channel_id):
         """Get channel info."""
@@ -210,14 +250,29 @@ class Database:
         return result
 
     def log_join_request(self, channel_id, user_id):
-        """Log a join request."""
+        """Log a join request with expiration time based on channel settings."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
         try:
+            # Get channel's approval timeout setting
             cursor.execute(
-                "INSERT INTO join_requests (channel_id, user_id) VALUES (?, ?)",
-                (channel_id, user_id)
+                "SELECT approval_timeout FROM channels WHERE channel_id = ?",
+                (channel_id,)
+            )
+            timeout_hours = cursor.fetchone()[0] or 24  # Default to 24 hours
+            
+            # Calculate expiration time
+            now = datetime.now()
+            expires_at = now + timedelta(hours=timeout_hours)
+            
+            cursor.execute(
+                """
+                INSERT INTO join_requests 
+                (channel_id, user_id, requested_at, expires_at) 
+                VALUES (?, ?, ?, ?)
+                """,
+                (channel_id, user_id, now.isoformat(), expires_at.isoformat())
             )
             conn.commit()
             return True
@@ -234,18 +289,76 @@ class Database:
         cursor = conn.cursor()
         
         try:
+            now = datetime.now().isoformat()
             cursor.execute(
-                "UPDATE join_requests SET approved_at = ? WHERE channel_id = ? AND user_id = ? AND approved_at IS NULL",
-                (datetime.now().isoformat(), channel_id, user_id)
+                """
+                UPDATE join_requests 
+                SET approved_at = ? 
+                WHERE channel_id = ? AND user_id = ? 
+                AND approved_at IS NULL 
+                AND (rejected_at IS NULL) 
+                AND (expires_at IS NULL OR expires_at > ?)
+                """,
+                (now, channel_id, user_id, now)
             )
             conn.commit()
-            return True
+            return cursor.rowcount > 0  # True if any row was updated
         except Exception as e:
             logging.error(f"Database error: {e}")
             conn.rollback()
             return False
         finally:
             conn.close()
+            
+    def reject_join_request(self, channel_id, user_id):
+        """Mark a join request as rejected (expired)."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        try:
+            now = datetime.now().isoformat()
+            cursor.execute(
+                """
+                UPDATE join_requests 
+                SET rejected_at = ? 
+                WHERE channel_id = ? AND user_id = ? 
+                AND approved_at IS NULL 
+                AND rejected_at IS NULL
+                """,
+                (now, channel_id, user_id)
+            )
+            conn.commit()
+            return cursor.rowcount > 0  # True if any row was updated
+        except Exception as e:
+            logging.error(f"Database error: {e}")
+            conn.rollback()
+            return False
+        finally:
+            conn.close()
+
+    def get_expired_requests(self):
+        """Get all expired join requests that haven't been handled yet."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        now = datetime.now().isoformat()
+        cursor.execute(
+            """
+            SELECT jr.*, c.title as channel_title
+            FROM join_requests jr
+            JOIN channels c ON jr.channel_id = c.channel_id
+            WHERE jr.approved_at IS NULL 
+            AND jr.rejected_at IS NULL
+            AND jr.expires_at < ?
+            """,
+            (now,)
+        )
+        
+        result = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        
+        return result
 
     def get_approval_count(self, channel_id):
         """Get count of approved join requests for a channel."""
@@ -261,3 +374,26 @@ class Database:
         conn.close()
         
         return result
+        
+    def get_pending_request(self, channel_id, user_id):
+        """Get a pending join request if it exists."""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        cursor.execute(
+            """
+            SELECT * FROM join_requests 
+            WHERE channel_id = ? AND user_id = ? 
+            AND approved_at IS NULL 
+            AND rejected_at IS NULL
+            ORDER BY requested_at DESC
+            LIMIT 1
+            """,
+            (channel_id, user_id)
+        )
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return dict(result) if result else None
